@@ -1,0 +1,200 @@
+name: Build & release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+env:
+  PYTHON_VERSION: "3.11"
+  APP_NAME: CZEditor
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install system libraries (Qt runtime + AppImage tooling)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgl1 libegl1 libxkbcommon0 libxkbcommon-x11-0 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-image0 libxcb-keysyms1 \
+            libxcb-randr0 libxcb-render-util0 libxcb-shape0 \
+            libxcb-xinerama0 libdbus-1-3 fuse libfuse2
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Generate icon assets from icon.svg
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python scripts/generate_icons.py
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --onefile --name "$APP_NAME" \
+            --add-data "assets:assets" \
+            run.py
+
+      - name: Package tar.gz
+        run: |
+          mkdir -p out
+          cp "dist/$APP_NAME" "out/$APP_NAME"
+          cp -r "locale/" "out/"
+          chmod +x "out/$APP_NAME"
+          tar -C out -czf "$APP_NAME-linux-x86_64.tar.gz" .
+
+      - name: Package AppImage
+        run: |
+          curl -fsSL -o appimagetool \
+            https://github.com/AppImage/AppImageKit/releases/download/continuous/appimagetool-x86_64.AppImage
+          chmod +x appimagetool
+
+          APPDIR="$APP_NAME.AppDir"
+          mkdir -p "$APPDIR/usr/bin" "$APPDIR/usr/share/icons/hicolor/512x512/apps"
+          cp "dist/$APP_NAME" "$APPDIR/usr/bin/$APP_NAME"
+          # locale sits beside the binary so i18n.py finds it next to sys.executable
+          cp -r "locale/" "$APPDIR/usr/bin/"
+          cp build_assets/icon.png "$APPDIR/usr/share/icons/hicolor/512x512/apps/czeditor.png"
+          cp build_assets/icon.png "$APPDIR/czeditor.png"
+
+          cat > "$APPDIR/czeditor.desktop" <<EOF
+          [Desktop Entry]
+          Type=Application
+          Name=$APP_NAME
+          Exec=$APP_NAME
+          Icon=czeditor
+          Categories=AudioVideo;Video;
+          EOF
+
+          cat > "$APPDIR/AppRun" <<'EOF'
+          #!/bin/sh
+          HERE="$(dirname "$(readlink -f "$0")")"
+          exec "$HERE/usr/bin/CZEditor" "$@"
+          EOF
+          chmod +x "$APPDIR/AppRun"
+
+          ARCH=x86_64 ./appimagetool "$APPDIR" "$APP_NAME-linux-x86_64.AppImage"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-binaries
+          path: |
+            ${{ env.APP_NAME }}-linux-x86_64.tar.gz
+            ${{ env.APP_NAME }}-linux-x86_64.AppImage
+
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Generate icon assets from icon.svg
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python scripts/generate_icons.py
+
+      - name: Build with PyInstaller
+        run: >
+          pyinstaller --onefile --windowed --name "$env:APP_NAME"
+          --icon build_assets\icon.ico
+          --add-data "assets;assets"
+          run.py
+
+      - name: Package zip (binary + locale)
+        run: |
+          New-Item -ItemType Directory -Force -Path out
+          Copy-Item "dist\$env:APP_NAME.exe" "out\$env:APP_NAME.exe"
+          Copy-Item -Recurse "locale" "out\locale"
+          Compress-Archive -Path "out\*" -DestinationPath "$env:APP_NAME-windows.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-binary
+          path: ${{ env.APP_NAME }}-windows.zip
+
+  macos:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Generate icon assets from icon.svg
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python scripts/generate_icons.py
+
+      - name: Build with PyInstaller
+        run: |
+          pyinstaller --windowed --name "$APP_NAME" \
+            --icon build_assets/icon.icns \
+            --add-data "assets:assets" \
+            --add-data "locale:locale" \
+            run.py
+
+      - name: Zip the .app bundle
+        run: |
+          ditto -c -k --sequesterRsrc --keepParent "dist/$APP_NAME.app" "$APP_NAME-macos.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-binary
+          path: ${{ env.APP_NAME }}-macos.zip
+
+  release:
+    needs: [linux, windows, macos]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Delete all pre-release tags and releases
+        run: |
+          gh api repos/${{ github.repository }}/releases --paginate -q '.[] | select(.prerelease == true) | "\(.id) \(.tag_name)"' | while read -r id tag; do
+            if [ -n "$id" ]; then
+              echo "Deleting pre-release release $tag (ID $id)"
+              gh api --method DELETE repos/${{ github.repository }}/releases/$id
+              
+              echo "Deleting remote tag ref: $tag"
+              gh api --method DELETE repos/${{ github.repository }}/git/refs/tags/$tag || true
+            fi
+          done
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Upload dev build
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: devbuild-${{ github.run_number }}
+          name: "Dev Build #${{ github.run_number }} (${{ github.sha }})"
+          prerelease: true
+          files: artifacts/*

@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+
+# PyInstaller
+build/
+dist/
+*.spec
+build_assets/
+
+# editors / macos littering
+.vscode/
+.idea/
+.DS_Store
+
+*.sh
