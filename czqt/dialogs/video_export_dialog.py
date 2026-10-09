@@ -63,14 +63,15 @@ def _cpu_count() -> int:
 
 
 def _default_worker_count() -> int:
-    # leave one core for the GUI/coordinator thread (which feeds ffmpeg's stdin);
-    # ffmpeg's own encoder threads soak up whatever the renderers don't use.
     n = _cpu_count()
     return max(1, n - 1) if n > 2 else n
 
 
 RING_BUDGET_BYTES = 384 * 1024 * 1024  # cap on shared-memory frame buffers
 MAX_RING_SLOTS = 64
+
+
+_ORPHAN_THREADS: set = set()  # keeps a still-running QThread alive if its dialog goes away
 
 
 class _ExportThread(QThread):
@@ -110,6 +111,7 @@ class _ExportThread(QThread):
         self._workers = max(1, workers or _default_worker_count())
         self._cancelled = False
         self._mp_cancel_event = None  # set once run() has an mp context to build one from
+        self._result: tuple = (False, "")
 
     def cancel(self) -> None:
         self._cancelled = True
@@ -174,8 +176,6 @@ class _ExportThread(QThread):
                 stderr=subprocess.PIPE,
             )
 
-            # ffmpeg's stderr is only read after the pipe closes; drain it now so a chatty
-            # encoder can't fill the pipe and stall the whole export.
             stderr_chunks: list = []
             stderr_thread = threading.Thread(
                 target=lambda: stderr_chunks.append(proc.stderr.read()), daemon=True)
@@ -235,7 +235,7 @@ class _ExportThread(QThread):
                     os.remove(self._output_path)
                 except OSError:
                     pass
-                self.finished_export.emit(False, i18n.tr("dialog.videoExport.cancelled"))
+                self._result = (False, i18n.tr("dialog.videoExport.cancelled"))
                 return
 
             proc.wait()
@@ -245,11 +245,11 @@ class _ExportThread(QThread):
             if proc.returncode != 0:
                 msg = stderr_data.decode("utf-8", "replace").strip()
                 snippet = msg[-800:] if len(msg) > 800 else msg
-                self.finished_export.emit(
+                self._result = (
                     False, i18n.tr("dialog.videoExport.ffmpegExited").format(code=proc.returncode, output=snippet)
                 )
             else:
-                self.finished_export.emit(True, self._output_path)
+                self._result = (True, self._output_path)
 
         except Exception as exc:
             if proc is not None:
@@ -258,7 +258,7 @@ class _ExportThread(QThread):
                     proc.wait()
                 except Exception:
                     pass
-            self.finished_export.emit(False, str(exc))
+            self._result = (False, str(exc))
 
         finally:
             if self._mp_cancel_event is not None:
@@ -287,6 +287,8 @@ class _ExportThread(QThread):
                     os.remove(wav_path)
                 except OSError:
                     pass
+            # emitted last, after all cleanup, so the GUI never reacts to a half-finished thread
+            self.finished_export.emit(*self._result)
 
     @staticmethod
     def _block_ranges(total_frames: int, num_workers: int) -> list:
@@ -599,7 +601,11 @@ class VideoExportDialog(QDialog):
         self._status_label.setText(msg)
 
     def _on_finished(self, success: bool, message: str) -> None:
+        t = self._thread
         self._thread = None
+        if t is not None:
+            t.wait()
+            t.deleteLater()
         self._set_exporting(False)
 
         if success:
@@ -636,8 +642,25 @@ class VideoExportDialog(QDialog):
             self._close_btn.setText(i18n.tr("dialog.videoExport.close"))
             self._close_btn.setEnabled(True)
 
-    def closeEvent(self, event) -> None:  # type: ignore[override]
+    def _shutdown_thread(self) -> None:
+        t = self._thread
+        if t is None:
+            return
+        t.cancel()
+        if not t.wait(20000):
+            # still cleaning up workers: keep it alive until it really finishes
+            _ORPHAN_THREADS.add(t)
+            t.finished.connect(lambda t=t: _ORPHAN_THREADS.discard(t))
+        else:
+            t.deleteLater()
+        self._thread = None
+
+    def reject(self) -> None:  # Esc key / close button
         if self._thread is not None:
-            self._thread.cancel()
-            self._thread.wait(3000)
+            self._on_close_clicked()  # cancel instead of tearing the dialog down mid-export
+            return
+        super().reject()
+
+    def closeEvent(self, event) -> None:  # type: ignore[override]
+        self._shutdown_thread()
         super().closeEvent(event)
